@@ -285,6 +285,14 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    # MCP servers register asynchronously at startup; block briefly so the
+    # tool snapshot returned here includes them.  Bounded — dead servers
+    # can't block this beyond the configured timeout.  See #<TBD>.
+    try:
+        from tools.mcp_tool import wait_for_mcp_servers_ready
+        wait_for_mcp_servers_ready()
+    except Exception:
+        pass
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).

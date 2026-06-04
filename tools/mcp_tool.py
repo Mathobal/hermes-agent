@@ -3760,6 +3760,72 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     return result
 
 
+def wait_for_mcp_servers_ready(timeout: float = 15.0) -> None:
+    """Block until every configured MCP server has registered and signalled ready.
+
+    Closes the startup race between asynchronous MCP server registration and
+    the first ``get_tool_definitions()`` snapshot.  ``discover_mcp_tools()``
+    schedules each server's connection in a background daemon thread and
+    returns immediately, so the first agent built can otherwise snapshot its
+    tool list before slow servers (e.g. ``npx @doist/todoist-ai`` cold-start,
+    ~2s) have registered — leaving those tools invisible for the whole
+    session until ``/reload-mcp``.
+
+    The wait is bounded by ``timeout``; a dead/unreachable server simply
+    isn't waited on past it.  No-op when ``mcp_servers`` isn't configured.
+    """
+    import time as _time
+
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.tools_config import _parse_enabled_flag
+    except Exception:
+        return
+
+    cfg = read_raw_config() or {}
+    expected = {
+        str(name)
+        for name, scfg in (cfg.get("mcp_servers") or {}).items()
+        if isinstance(scfg, dict)
+        and _parse_enabled_flag(scfg.get("enabled", True), default=True)
+    }
+    if not expected:
+        return
+
+    # Phase 1: poll until every expected server appears in the registry.
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        with _lock:
+            registered = set(_servers.keys())
+        if expected.issubset(registered):
+            break
+        _time.sleep(0.05)
+
+    # Phase 2: await each registered server's _ready event in parallel on the
+    # MCP event loop.  Servers not yet registered (Phase 1 timed out) are
+    # skipped; they'll appear via /reload-mcp once they connect.
+    with _lock:
+        servers_snapshot = [s for n, s in _servers.items() if n in expected]
+    loop = _mcp_loop
+    if loop is None or not loop.is_running() or not servers_snapshot:
+        return
+
+    remaining = max(0.1, deadline - _time.monotonic())
+
+    async def _await_all():
+        async def _one(srv: MCPServerTask) -> None:
+            try:
+                await asyncio.wait_for(srv._ready.wait(), timeout=remaining)
+            except Exception:
+                pass
+        await asyncio.gather(*(_one(s) for s in servers_snapshot))
+
+    try:
+        _run_on_mcp_loop(_await_all(), timeout=remaining + 2)
+    except Exception as exc:
+        logger.debug("wait_for_mcp_servers_ready aborted: %s", exc)
+
+
 def shutdown_mcp_servers():
     """Close all MCP server connections and stop the background loop.
 
